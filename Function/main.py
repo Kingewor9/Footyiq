@@ -5,32 +5,35 @@ import hashlib
 import hmac
 import urllib.parse
 from datetime import datetime, timedelta
-from firebase_admin import initialize_app, firestore, auth
-from firebase_admin.exceptions import FirebaseError
-from google.cloud import functions
-from concurrent.futures import TimeoutError
+import random
 
-# Initialize Firebase Admin SDK
-# The SDK automatically uses environment credentials when deployed to Cloud Functions
-try:
-    initialize_app()
-except ValueError as e:
-    # This might happen if initialize_app() is called multiple times in a local testing environment
-    # In production, it only runs once per function instance
-    print(f"Firebase already initialized or error: {e}")
+# Import Firebase Admin/Functions SDKs
+import firebase_admin
+from firebase_admin import firestore, auth
+from firebase_functions import https_fn, options
+from firebase_admin.exceptions import FirebaseError
+
+# --- Configuration and Initialization ---
+
+# Initialize Firebase Admin SDK (must be called only once)
+if not firebase_admin._apps:
+    try:
+        firebase_admin.initialize_app()
+    except ValueError as e:
+        print(f"Firebase initialization error (might be okay if already initialized): {e}")
 
 db = firestore.client()
-# NOTE: Replace 'default-footy-iq-app-id' with the __app_id used in your React frontend
-APP_ID = os.environ.get('APP_ID', 'default-footy-iq-app-id')
-# NOTE: Set this environment variable during deployment (your Telegram user ID/Firebase UID)
-ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID')
-# NEW: You MUST set this environment variable for the auth bridge to work!
+
+# IMPORTANT: These must be set as environment variables during deployment:
+# Example: firebase functions:config:set app.id="[YOUR_APP_ID]"
+APP_ID = os.environ.get('APP_ID', 'default-footy-iq-app-id') 
+ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID') # Your Telegram/Firebase UID
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 
 
 # --- Utility Functions ---
 
-def get_user_id_from_token(req):
+def get_user_id_from_token(req: https_fn.Request) -> str | None:
     """Securely verifies and extracts the user ID from the Firebase ID Token."""
     auth_header = req.headers.get('Authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
@@ -46,24 +49,11 @@ def get_user_id_from_token(req):
         print(f"Token verification failed: {e}")
         return None
 
-def json_response(data, status=200):
-    """Helper to return JSON responses with correct CORS headers."""
-    # Cloud Functions automatically handles OPTIONS/preflight requests,
-    # but we manually set CORS for simplicity
-    headers = {
-        'Access-Control-Allow-Origin': '*',
-        'Content-Type': 'application/json'
-    }
-    return functions.http.Response(
-        json.dumps(data),
-        status=status,
-        headers=headers
-    )
-
 def verify_telegram_data(init_data: str) -> dict | None:
     """
     Cryptographically verifies the Telegram WebApp initData hash using the Bot Token.
     Returns the verified data dictionary if successful, or None if validation fails.
+    (Adopted official Telegram verification method from your provided code.)
     """
     if not TELEGRAM_BOT_TOKEN:
         print("TELEGRAM_BOT_TOKEN not set in environment variables.")
@@ -72,14 +62,13 @@ def verify_telegram_data(init_data: str) -> dict | None:
     # 1. Separate hash from other parameters
     parsed_data = urllib.parse.parse_qs(init_data)
     
-    # Ensure 'hash' is present and extract it.
     if 'hash' not in parsed_data:
         return None
         
     hash_value = parsed_data.pop('hash')[0]
 
     # 2. Sort and concatenate parameters (excluding hash)
-    # Re-encode for comparison, ensuring key=value format for all pairs
+    # The sort order is crucial for verification
     check_string = '&'.join([
         f'{key}={value[0]}' 
         for key, value in sorted(parsed_data.items())
@@ -88,11 +77,12 @@ def verify_telegram_data(init_data: str) -> dict | None:
     # 3. Calculate Secret Key
     secret_key = hmac.new(
         key=b"WebAppData",
+        # Use the Telegram Bot Token for HMAC key creation
         msg=TELEGRAM_BOT_TOKEN.encode(),
         digestmod=hashlib.sha256
     ).digest()
 
-    # 4. Calculate HMAC
+    # 4. Calculate HMAC against the check string
     calculated_hash = hmac.new(
         key=secret_key,
         msg=check_string.encode(),
@@ -111,45 +101,41 @@ def verify_telegram_data(init_data: str) -> dict | None:
         
     return None
 
-# --- 0. TELEGRAM AUTH BRIDGE FUNCTION (NEW AND CRITICAL) ---
+# --- 0. TELEGRAM AUTH BRIDGE FUNCTION ---
 # Endpoint: POST /auth/telegram
-
-def telegram_auth_bridge(req):
+@https_fn.on_request(
+    cors=options.CorsOptions(allow_methods=["POST"], allow_origin=["*"]) 
+)
+def telegram_auth_bridge(req: https_fn.Request) -> https_fn.Response:
     """
     Secures the Telegram Mini App by verifying initData and minting a Firebase Custom Token.
-    This function should be called ONLY by the frontend upon first launch/sign-in.
     """
-    if req.method == 'OPTIONS':
-        return json_response('', status=204)
+    if req.method != 'POST':
+        return https_fn.Response("Method Not Allowed", status=405)
 
     try:
         data = req.get_json(silent=True)
         init_data = data.get('initData')
         
         if not init_data:
-            return json_response({'error': 'Missing initData in payload.'}, status=400)
+            return https_fn.Response(json.dumps({'error': 'Missing initData in payload.'}), status=400, content_type="application/json")
 
-        # Step 1: Verify the Telegram Data
         telegram_user = verify_telegram_data(init_data)
 
         if not telegram_user:
-            return json_response({'error': 'Invalid or expired Telegram initiation data.'}, status=401)
+            return https_fn.Response(json.dumps({'error': 'Invalid or expired Telegram initiation data.'}), status=401, content_type="application/json")
 
-        # Step 2: Extract Telegram User ID (UID for Firebase)
+        # Extract Telegram User ID (UID for Firebase)
         telegram_uid = str(telegram_user['id'])
         
-        # Step 3: Mint the Firebase Custom Token
-        # Use the Telegram User ID as the Firebase UID for consistency
+        # Mint the Firebase Custom Token
         custom_token = auth.create_custom_token(telegram_uid, {
             'telegram_id': telegram_uid,
             'username': telegram_user.get('username'),
             'first_name': telegram_user.get('first_name')
         })
 
-        # Step 4: Ensure User Profile Exists (Optional, but good practice)
-        # Create a user in Firebase Auth if they don't exist (handled implicitly by sign-in)
-        # We also ensure a basic Firestore profile exists.
-        
+        # Ensure User Profile Exists (Initialize profile data if first login)
         user_profile_ref = db.document(f'artifacts/{APP_ID}/users/{telegram_uid}/gameData/profile')
         user_profile_ref.set({
             'telegram_id': telegram_uid,
@@ -158,38 +144,39 @@ def telegram_auth_bridge(req):
             'last_login': firestore.SERVER_TIMESTAMP
         }, merge=True)
 
-        return json_response({'customToken': custom_token.decode('utf-8')})
+        return https_fn.Response(json.dumps({'customToken': custom_token.decode('utf-8')}), status=200, content_type="application/json")
 
     except Exception as e:
         print(f"Error in Telegram Auth Bridge: {e}")
-        return json_response({'error': 'Internal authentication error.'}, status=500)
+        return https_fn.Response(json.dumps({'error': 'Internal authentication error.'}), status=500, content_type="application/json")
 
 # --- 1. ADMIN QUIZ UPLOAD FUNCTION ---
 # Endpoint: POST /admin/upload_quiz
-
-def admin_upload_quiz(req):
-# ... (function body remains the same) ...
+@https_fn.on_request(
+    cors=options.CorsOptions(allow_methods=["POST"], allow_origin=["*"]) 
+)
+def admin_upload_quiz(req: https_fn.Request) -> https_fn.Response:
     """
     Secured function to upload a new quiz to Firestore. 
     Requires valid Firebase ID Token and matching ADMIN_USER_ID.
     """
-    if req.method == 'OPTIONS':
-        return json_response('', status=204) # Handle preflight
+    if req.method != 'POST':
+        return https_fn.Response("Method Not Allowed", status=405)
 
     try:
         # Step 1: Authentication and Authorization Check
         user_id = get_user_id_from_token(req)
         if not user_id:
-            return json_response({'error': 'Unauthorized: Missing or invalid token.'}, status=401)
+            return https_fn.Response(json.dumps({'error': 'Unauthorized: Missing or invalid token.'}), status=401, content_type="application/json")
             
         if user_id != ADMIN_USER_ID:
             print(f"Unauthorized admin attempt by user: {user_id}")
-            return json_response({'error': 'Forbidden: User is not the designated admin.'}, status=403)
+            return https_fn.Response(json.dumps({'error': 'Forbidden: User is not the designated admin.'}), status=403, content_type="application/json")
 
         # Step 2: Parse and Validate Data
         data = req.get_json(silent=True)
         if not data or 'quizId' not in data or 'questions' not in data:
-            return json_response({'error': 'Invalid request body or missing quizId/questions.'}, status=400)
+            return https_fn.Response(json.dumps({'error': 'Invalid request body or missing quizId/questions.'}), status=400, content_type="application/json")
 
         quiz_id = data['quizId']
         # Ensure 'expiresAt' is set, otherwise set it for 24 hours from now
@@ -201,16 +188,13 @@ def admin_upload_quiz(req):
         public_quiz_data = {
             k: v for k, v in data.items() if k not in ['questions']
         }
-        # The public version only needs ID, name, totalPoints, etc., but not the full question list
-        # For the frontend to fetch questions, it will call another function or use the quiz ID to locate them.
         
-        # We store minimal metadata in the public collection and the full quiz (with answers) in admin collection
         public_quiz_data['quizId'] = quiz_id
         public_quiz_data['expiresAt'] = expires_at
         public_quiz_data['totalQuestions'] = len(data['questions'])
 
 
-        # Step 3: Write to Firestore (Transaction not strictly needed here)
+        # Step 3: Write to Firestore 
         secure_ref = db.collection(f'artifacts/{APP_ID}/admin/quizzes').document(quiz_id)
         public_ref = db.collection(f'artifacts/{APP_ID}/public/data/activeQuizzes').document(quiz_id)
         
@@ -220,26 +204,25 @@ def admin_upload_quiz(req):
         # Public Write (Quiz metadata)
         public_ref.set(public_quiz_data)
 
-        return json_response({'message': f'Quiz {quiz_id} uploaded successfully.', 'quizId': quiz_id})
+        return https_fn.Response(json.dumps({'message': f'Quiz {quiz_id} uploaded successfully.', 'quizId': quiz_id}), status=200, content_type="application/json")
 
     except Exception as e:
         print(f"Error during admin quiz upload: {e}")
-        return json_response({'error': 'Internal server error.'}, status=500)
+        return https_fn.Response(json.dumps({'error': 'Internal server error.'}), status=500, content_type="application/json")
 
 # --- 2. GET ACTIVE QUIZZES FUNCTION ---
 # Endpoint: GET /quiz/active
-
-def get_active_quizzes(req):
-# ... (function body remains the same) ...
+@https_fn.on_request(
+    cors=options.CorsOptions(allow_methods=["GET"], allow_origin=["*"]) 
+)
+def get_active_quizzes(req: https_fn.Request) -> https_fn.Response:
     """
     Public function to fetch all currently active quiz IDs and metadata.
-    Does NOT return correct answers.
     """
-    if req.method == 'OPTIONS':
-        return json_response('', status=204) # Handle preflight
+    if req.method != 'GET':
+        return https_fn.Response("Method Not Allowed", status=405)
         
     try:
-        # Query active quizzes collection
         active_quizzes_ref = db.collection(f'artifacts/{APP_ID}/public/data/activeQuizzes')
         now = int(time.time() * 1000)
         
@@ -252,46 +235,55 @@ def get_active_quizzes(req):
         for doc in docs:
             quizzes.append(doc.to_dict())
         
-        return json_response({'quizzes': quizzes})
+        return https_fn.Response(json.dumps({'quizzes': quizzes}), status=200, content_type="application/json")
 
     except Exception as e:
         print(f"Error fetching active quizzes: {e}")
-        return json_response({'error': 'Internal server error.'}, status=500)
+        return https_fn.Response(json.dumps({'error': 'Internal server error.'}), status=500, content_type="application/json")
 
 # --- 3. SCORE SUBMISSION AND VALIDATION FUNCTION (CRITICAL) ---
 # Endpoint: POST /quiz/submit
-
-def submit_quiz_score(req):
-# ... (function body remains the same) ...
+@https_fn.on_request(
+    cors=options.CorsOptions(allow_methods=["POST"], allow_origin=["*"]) 
+)
+def submit_quiz_score(req: https_fn.Request) -> https_fn.Response:
     """
     Secured function to validate user answers, calculate score, and update user profile using a transaction.
     """
-    if req.method == 'OPTIONS':
-        return json_response('', status=204) # Handle preflight
+    if req.method != 'POST':
+        return https_fn.Response("Method Not Allowed", status=405)
 
     try:
         # Step 1: Authentication
         user_id = get_user_id_from_token(req)
         if not user_id:
-            return json_response({'error': 'Unauthorized: Missing or invalid token.'}, status=401)
+            return https_fn.Response(json.dumps({'error': 'Unauthorized: Missing or invalid token.'}), status=401, content_type="application/json")
         
         # Step 2: Data Validation
         data = req.get_json(silent=True)
         if not data or 'quizId' not in data or 'answers' not in data:
-            return json_response({'error': 'Invalid payload.'}, status=400)
+            return https_fn.Response(json.dumps({'error': 'Invalid payload.'}), status=400, content_type="application/json")
 
         quiz_id = data['quizId']
-        answers = data['answers'] # Expected format: [{questionId: 1, selectedOption: "A"}, ...]
+        answers = data['answers'] 
 
         # Step 3: Fetch Secure Quiz Data (Answers)
         secure_quiz_ref = db.collection(f'artifacts/{APP_ID}/admin/quizzes').document(quiz_id)
         secure_quiz_snap = secure_quiz_ref.get()
 
         if not secure_quiz_snap.exists:
-            return json_response({'error': 'Quiz not found or expired.'}, status=404)
+            return https_fn.Response(json.dumps({'error': 'Quiz not found or expired.'}), status=404, content_type="application/json")
         
         secure_quiz = secure_quiz_snap.to_dict()
-        points_per_question = secure_quiz.get('totalPoints', 0) / secure_quiz.get('totalQuestions', 1)
+        
+        # Handle case where quiz data is missing score info (prevent division by zero)
+        total_questions = secure_quiz.get('totalQuestions') or len(secure_quiz.get('questions', []))
+        total_points = secure_quiz.get('totalPoints') or (total_questions * 10) # Default to 10 points per question
+        
+        if total_questions == 0:
+             return https_fn.Response(json.dumps({'error': 'Quiz structure is invalid (0 questions).'}), status=400, content_type="application/json")
+             
+        points_per_question = total_points / total_questions
         
         # Create a map for quick lookup of correct answers
         correct_map = {q['questionId']: q['correctAnswer'] for q in secure_quiz.get('questions', [])}
@@ -329,10 +321,10 @@ def submit_quiz_score(req):
                 # Update user data
                 transaction.set(profile_ref, {
                     'score': new_score,
-                    'leagueScore': new_score, # Typically league score is the same as global score
-                    'globalRank': '#calculating', # Rank is updated by a separate scheduled function
-                    f'quizzes_completed.{quiz_id}': firestore.SERVER_TIMESTAMP, # Mark as completed
-                    f'latest_submission.{quiz_id}': score_details # Optional: store details
+                    'leagueScore': new_score, 
+                    'globalRank': '#calculating', 
+                    f'quizzes_completed.{quiz_id}': firestore.SERVER_TIMESTAMP, 
+                    f'latest_submission.{quiz_id}': score_details 
                 }, merge=True)
                 
                 return new_score
@@ -346,50 +338,42 @@ def submit_quiz_score(req):
             )
 
             # Step 6: Success Response
-            return json_response({
-                'message': 'Score submitted and validated successfully.',
-                'pointsEarned': points_earned,
-                'correctCount': correct_count,
-                'totalScore': new_total_score
-            })
+            return https_fn.Response(
+                json.dumps({
+                    'message': 'Score submitted and validated successfully.',
+                    'pointsEarned': points_earned,
+                    'correctCount': correct_count,
+                    'totalScore': new_total_score
+                }), 
+                status=200, 
+                content_type="application/json"
+            )
 
         except TimeoutError:
-             return json_response({'error': 'Transaction timed out. Try again.'}, status=503)
+            return https_fn.Response(json.dumps({'error': 'Transaction timed out. Try again.'}), status=503, content_type="application/json")
         except ValueError as ve:
-             return json_response({'error': str(ve)}, status=409) # 409 Conflict for duplicate submission
+            return https_fn.Response(json.dumps({'error': str(ve)}), status=409, content_type="application/json") # 409 Conflict for duplicate submission
         except Exception as te:
             print(f"Firestore Transaction Error: {te}")
-            return json_response({'error': 'Failed to update score due to transaction error.'}, status=500)
+            return https_fn.Response(json.dumps({'error': 'Failed to update score due to transaction error.'}), status=500, content_type="application/json")
 
     except Exception as e:
         print(f"Unhandled error in submit_quiz_score: {e}")
-        return json_response({'error': 'Internal server error.'}, status=500)
+        return https_fn.Response(json.dumps({'error': 'Internal server error.'}), status=500, content_type="application/json")
 
 # --- 4. LEADERBOARD RETRIEVAL FUNCTION ---
 # Endpoint: GET /leaderboard/global
-
-def get_global_leaderboard(req):
-# ... (function body remains the same) ...
+@https_fn.on_request(
+    cors=options.CorsOptions(allow_methods=["GET"], allow_origin=["*"]) 
+)
+def get_global_leaderboard(req: https_fn.Request) -> https_fn.Response:
     """
     Public function to fetch a simple global leaderboard.
-    NOTE: This is not optimized for massive scale. For production, use BigQuery/scheduled functions.
     """
-    if req.method == 'OPTIONS':
-        return json_response('', status=204) # Handle preflight
+    if req.method != 'GET':
+        return https_fn.Response("Method Not Allowed", status=405)
 
     try:
-        # Query all user profiles (limited to prevent excessive reads)
-        users_ref = db.collection(f'artifacts/{APP_ID}/users')
-        
-        # We need to query the 'gameData' subcollection in a complex way.
-        # Since this structure is not simple for a single collection query, we simulate the fetch:
-        
-        # 1. Fetch the user documents who have a 'gameData/profile' subcollection (simulated)
-        # In a real app, you would have a single indexed 'LeaderboardEntries' collection.
-        
-        # SIMULATED Leaderboard fetch (Top 50 by score)
-        # A real production setup would require a dedicated leaderboard collection
-        
         leaderboard_ref = db.collection(f'artifacts/{APP_ID}/public/data/leaderboard')
         
         # Fetch top 50 entries
@@ -408,8 +392,8 @@ def get_global_leaderboard(req):
             })
             rank += 1
             
-        return json_response({'leaderboard': leaderboard})
+        return https_fn.Response(json.dumps({'leaderboard': leaderboard}), status=200, content_type="application/json")
 
     except Exception as e:
         print(f"Error fetching leaderboard: {e}")
-        return json_response({'error': 'Internal server error.'}, status=500)
+        return https_fn.Response(json.dumps({'error': 'Internal server error.'}), status=500, content_type="application/json")
